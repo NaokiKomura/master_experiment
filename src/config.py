@@ -19,6 +19,12 @@ CHAT_MODEL = "gpt-4o"
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0"))
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "256"))
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "") or None
+GENERATION_PARAMS = {
+    "temperature": 0.0,
+    "top_p":1.0,
+    "max_tokens":1000,
+    "seed":16
+}
 
 # --- Neo4j設定 ---
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")

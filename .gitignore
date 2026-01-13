@@ -4,3 +4,4 @@ outputs/
 __pycache__/
 .ipynb_checkpoints/
 src/embedding_cache.json
+src/embedding_cache.json

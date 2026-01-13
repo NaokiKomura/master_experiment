@@ -35,7 +35,13 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# Ensure this script's directory (src/) is on sys.path so that `import baselines` works
+SRC_DIR = Path(__file__).resolve().parent
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 import pandas as pd
 from neo4j import GraphDatabase
@@ -65,10 +71,12 @@ try:
 except Exception:  # pragma: no cover
     rag_app = None
 
+_BASELINES_IMPORT_ERROR: Optional[Exception] = None
 try:
     import baselines  # type: ignore
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
     baselines = None
+    _BASELINES_IMPORT_ERROR = e
 
 
 # --- Metrics ---
@@ -138,8 +146,9 @@ def _require_modules() -> None:
 
 def _require_baselines() -> None:
     if baselines is None:
+        detail = f" / cause: {_BASELINES_IMPORT_ERROR}" if _BASELINES_IMPORT_ERROR is not None else ""
         raise RuntimeError(
-            "baselines.py がimportできません。src/baselines.py が存在し、Pythonのimportパスに含まれていることを確認してください。"
+            "baselines.py がimportできません。src/baselines.py が存在し、Pythonのimportパスに含まれていることを確認してください。" + detail
         )
 
 
