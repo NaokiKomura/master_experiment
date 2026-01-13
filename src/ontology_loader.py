@@ -218,9 +218,177 @@ def setup_ontology(load_mode="full"):
                 DETACH DELETE n
             """)
             create_constraints(session)
-            # ※ ここに前回のデータ投入ロジック(for item in RISK_CONCEPTS...)が入ります
-            # 長くなるため、前回の回答コードのロジック部分を使用してください
-            pass 
+
+            # --- Load Risk Concepts ---
+            for item in RISK_CONCEPTS:
+                concept_id = item["id"]
+                concept_name = item.get("name")
+                definition = item.get("definition")
+                domain = item.get("domain")
+                valid_eras = item.get("valid_eras", [])
+                sensitivity_map = item.get("sensitivity_map", {})
+
+                # Embeddings (optional)
+                concept_embedding = embedder.get_embedding(
+                    " ".join([str(concept_name or ""), str(definition or ""), " ".join(item.get("typical_associations", []) or [])]).strip()
+                )
+
+                # RiskFactor
+                rf = item.get("risk_factor", {}) or {}
+                rf_id = rf.get("id")
+                rf_label = rf.get("label")
+
+                # Norm
+                norm = item.get("norm", {}) or {}
+                norm_name = norm.get("name")
+                norm_type = norm.get("type")
+                norm_issuer = norm.get("issuer")
+                norm_jurisdiction = norm.get("jurisdiction")
+
+                # Create/Merge core nodes
+                session.run(
+                    """
+                    MERGE (c:Concept {id: $concept_id})
+                    SET c.name = $concept_name,
+                        c.definition = $definition,
+                        c.domain = $domain,
+                        c.valid_eras = $valid_eras,
+                        c.sensitivity_map = $sensitivity_map,
+                        c.embedding = $concept_embedding
+                    WITH c
+                    MERGE (r:RiskFactor {id: $rf_id})
+                    SET r.label = $rf_label
+                    MERGE (c)-[:HAS_RISK_FACTOR]->(r)
+                    WITH c, r
+                    MERGE (n:Norm {name: $norm_name})
+                    SET n.type = $norm_type,
+                        n.issuer = $norm_issuer,
+                        n.jurisdiction = $norm_jurisdiction
+                    MERGE (r)-[:GOVERNED_BY]->(n)
+                    """,
+                    concept_id=concept_id,
+                    concept_name=concept_name,
+                    definition=definition,
+                    domain=domain,
+                    valid_eras=valid_eras,
+                    sensitivity_map=sensitivity_map,
+                    concept_embedding=concept_embedding,
+                    rf_id=rf_id,
+                    rf_label=rf_label,
+                    norm_name=norm_name,
+                    norm_type=norm_type,
+                    norm_issuer=norm_issuer,
+                    norm_jurisdiction=norm_jurisdiction,
+                )
+
+                # Affected groups
+                for g in item.get("affected_groups", []) or []:
+                    session.run(
+                        """
+                        MATCH (c:Concept {id: $concept_id})
+                        MERGE (ag:AffectedGroup {name: $name})
+                        MERGE (c)-[:AFFECTS]->(ag)
+                        """,
+                        concept_id=concept_id,
+                        name=g,
+                    )
+
+                # Typical associations (with embeddings)
+                for assoc in item.get("typical_associations", []) or []:
+                    assoc_embedding = embedder.get_embedding(str(assoc))
+                    session.run(
+                        """
+                        MATCH (c:Concept {id: $concept_id})
+                        MERGE (a:TypicalAssociation {name: $name})
+                        SET a.embedding = $embedding
+                        MERGE (c)-[:HAS_ASSOCIATION]->(a)
+                        """,
+                        concept_id=concept_id,
+                        name=assoc,
+                        embedding=assoc_embedding,
+                    )
+
+                # Related roles
+                for role in item.get("related_roles", []) or []:
+                    session.run(
+                        """
+                        MATCH (c:Concept {id: $concept_id})
+                        MERGE (rc:RoleConcept {name: $name})
+                        MERGE (c)-[:RELATED_ROLE]->(rc)
+                        """,
+                        concept_id=concept_id,
+                        name=role,
+                    )
+
+            # --- Load Context Concepts ---
+            for ctx in CONTEXT_CONCEPTS:
+                ctx_id = ctx["id"]
+                ctx_name = ctx.get("name")
+                attributes = ctx.get("attributes", [])
+                domain = ctx.get("domain")
+                valid_eras = ctx.get("valid_eras", [])
+                sensitivity_map = ctx.get("sensitivity_map", {})
+
+                # RiskFactor
+                rf = ctx.get("risk_factor", {}) or {}
+                rf_id = rf.get("id")
+                rf_label = rf.get("label")
+
+                # Norm
+                norm = ctx.get("norm", {}) or {}
+                norm_name = norm.get("name")
+                norm_type = norm.get("type")
+                norm_issuer = norm.get("issuer")
+                norm_jurisdiction = norm.get("jurisdiction")
+
+                ctx_embedding = embedder.get_embedding(
+                    " ".join([str(ctx_name or ""), " ".join(attributes or [])]).strip()
+                )
+
+                session.run(
+                    """
+                    MERGE (cc:ContextConcept {id: $ctx_id})
+                    SET cc.name = $ctx_name,
+                        cc.attributes = $attributes,
+                        cc.domain = $domain,
+                        cc.valid_eras = $valid_eras,
+                        cc.sensitivity_map = $sensitivity_map,
+                        cc.embedding = $ctx_embedding
+                    WITH cc
+                    MERGE (r:RiskFactor {id: $rf_id})
+                    SET r.label = $rf_label
+                    MERGE (cc)-[:HAS_RISK_FACTOR]->(r)
+                    WITH cc, r
+                    MERGE (n:Norm {name: $norm_name})
+                    SET n.type = $norm_type,
+                        n.issuer = $norm_issuer,
+                        n.jurisdiction = $norm_jurisdiction
+                    MERGE (r)-[:GOVERNED_BY]->(n)
+                    """,
+                    ctx_id=ctx_id,
+                    ctx_name=ctx_name,
+                    attributes=attributes,
+                    domain=domain,
+                    valid_eras=valid_eras,
+                    sensitivity_map=sensitivity_map,
+                    ctx_embedding=ctx_embedding,
+                    rf_id=rf_id,
+                    rf_label=rf_label,
+                    norm_name=norm_name,
+                    norm_type=norm_type,
+                    norm_issuer=norm_issuer,
+                    norm_jurisdiction=norm_jurisdiction,
+                )
+
+            # Simple sanity logs
+            try:
+                n_concepts = session.run("MATCH (c:Concept) RETURN count(c) AS n").single()["n"]
+                n_ctx = session.run("MATCH (c:ContextConcept) RETURN count(c) AS n").single()["n"]
+                n_rf = session.run("MATCH (r:RiskFactor) RETURN count(r) AS n").single()["n"]
+                n_norm = session.run("MATCH (n:Norm) RETURN count(n) AS n").single()["n"]
+                print(f"Loaded: Concept={n_concepts}, ContextConcept={n_ctx}, RiskFactor={n_rf}, Norm={n_norm}")
+            except Exception:
+                pass
 
     print(">>> Ontology Load Complete.")
 
