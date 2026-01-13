@@ -1,13 +1,28 @@
+import os
 from openai import OpenAI
 from neo4j import GraphDatabase
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
+# --- Matplotlib font setup (macOS Japanese) ---
+# Prefer Hiragino Sans; include fallbacks in case the exact family name differs per system.
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = [
+    'Hiragino Sans',
+    'Hiragino Kaku Gothic ProN',
+    'Hiragino Kaku Gothic Pro',
+    'Yu Gothic',
+    'Noto Sans CJK JP',
+    'AppleGothic',
+    'Arial Unicode MS',
+]
+plt.rcParams['axes.unicode_minus'] = False
+
 # --- 設定 ---
-client = OpenAI(api_key="sk-proj-sy----") # 既存のキー
-URI = "bolt://localhost:7687"
-AUTH = ("neo4j", "-----") 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+AUTH = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD"))
 
 # --- 知識データの定義 ---
 RISK_KNOWLEDGE = [
@@ -99,20 +114,28 @@ def visualize_ontology_diagram(knowledge_data):
     # 色の設定
     colors = [color_map[G.nodes[node]['label_type']] for node in G.nodes()]
 
-    # 日本語フォントの設定（環境内のNoto Sans CJK JPを使用）
+    # 日本語フォントの設定（Hiragino Sans を優先。見つからない場合は rcParams のフォールバックに任せる）
+    prop = None
     try:
-        font_path = fm.findfont(fm.FontProperties(family="Hiragino Sans"))
-        prop = fm.FontProperties(fname=font_path)
-    except:
-        prop = fm.FontProperties()
+        font_path = fm.findfont(fm.FontProperties(family="Hiragino Sans"), fallback_to_default=True)
+        if font_path and os.path.exists(font_path):
+            prop = fm.FontProperties(fname=font_path)
+    except Exception:
+        prop = None
 
     # レイアウトと描画
     fig, ax = plt.subplots(figsize=(12, 8))
     pos = nx.spring_layout(G, k=0.8, iterations=50, seed=42)
     
-    nx.draw(G, pos, with_labels=True, node_color=colors, node_size=3000, 
-            font_size=9, font_family=prop.get_name(), edge_color="#BBBBBB", 
-            width=1.5, arrowsize=20, ax=ax)
+    # Draw nodes/edges first (labels are drawn separately to control Japanese font reliably)
+    nx.draw_networkx_nodes(G, pos, node_color=colors, node_size=3000, ax=ax, alpha=0.95)
+    nx.draw_networkx_edges(G, pos, edge_color="#BBBBBB", width=1.5, arrows=True, arrowsize=20, ax=ax)
+
+    # Draw labels with explicit FontProperties when available
+    label_kwargs = {"font_size": 9}
+    if prop is not None:
+        label_kwargs["font_properties"] = prop
+    nx.draw_networkx_labels(G, pos, labels={n: n for n in G.nodes()}, ax=ax, **label_kwargs)
     
     # 凡例の追加
     from matplotlib.lines import Line2D

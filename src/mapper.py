@@ -21,8 +21,8 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 AUTH = (NEO4J_USER, NEO4J_PASSWORD)
 
 # 実験パラメータ (論文の再現性に関わる重要定数)
-SIMILARITY_THRESHOLD = 0.72   # 類似度閾値
-MARGIN_THRESHOLD = 0.02       # 2位との差がこれ未満なら「曖昧」と判定
+SIMILARITY_THRESHOLD = 0.78  # 類似度閾値
+MARGIN_THRESHOLD = 0.05       # 2位との差がこれ未満なら「曖昧」と判定
 EMBEDDING_MODEL = "text-embedding-3-small"
 TOP_K_CANDIDATES = 3          # 候補取得数
 

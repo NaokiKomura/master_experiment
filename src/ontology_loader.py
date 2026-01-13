@@ -6,6 +6,24 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from neo4j import GraphDatabase
 
+import matplotlib.pyplot as plt
+import networkx as nx
+import matplotlib.font_manager as fm
+
+# --- Matplotlib font setup (macOS Japanese) ---
+# Prefer Hiragino Sans; include fallbacks in case the exact family name differs per system.
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = [
+    'Hiragino Sans',
+    'Hiragino Kaku Gothic ProN',
+    'Hiragino Kaku Gothic Pro',
+    'Yu Gothic',
+    'Noto Sans CJK JP',
+    'AppleGothic',
+    'Arial Unicode MS',
+]
+plt.rcParams['axes.unicode_minus'] = False
+
 # 環境変数の読み込み
 load_dotenv()
 
@@ -41,9 +59,9 @@ RISK_CONCEPTS = [
         "domain": DOMAIN_VALUE,
         "risk_factor": {"id": "Gender_Stereotype", "label": "ジェンダー・ステレオタイプ"},
         "norm": {
-            "name": "男女共同参画社会基本法", 
-            "type": "law",
-            "issuer": "日本政府",
+            "name": "男女共同参画社会", 
+            "type": "society",
+            "issuer": "日本",
             "jurisdiction": "Japan"
         },
         "affected_groups": ["働く女性", "主婦層", "男性"],
@@ -66,7 +84,7 @@ RISK_CONCEPTS = [
         },
         "affected_groups": ["女性全般", "未成年"],
         "typical_associations": ["無意味な露出", "胸や脚の強調", "萌え絵", "性的なアングル"],
-        "related_roles": ["女性タレント", "女子高生", "キャンペーンガール"],
+        "related_roles": ["女性タレント", "女子高生", "キャンペーンガール","水着姿の女性"],
         "valid_eras": ["2010s", "2020s"],
         "sensitivity_map": {"2010s": "medium", "2020s": "high"}
     },
@@ -108,6 +126,24 @@ RISK_CONCEPTS = [
         "valid_eras": ["2020s"],
         "sensitivity_map": {"2010s": "none", "2020s": "medium"}
     },
+    {
+        "id": "Racism",
+        "name": "人種差別",
+        "definition": "人種によって差別を行う表現。黒人に対する迫害的な表現などをすること。",
+        "domain": DOMAIN_VALUE,
+        "risk_factor": {"id": "Racism", "label": "レイシズム"},
+        "norm": {
+            "name": "メディアにおける倫理ガイドライン", 
+            "type": "guideline",
+            "issuer": "JIAA",
+            "jurisdiction": "Advertising_Industry"
+        },
+        "affected_groups": ["黒人", "少数民族"],
+        "typical_associations": ["黒人は汚らしい", "猿"],
+        "related_roles": ["黒人"],
+        "valid_eras": ["2020s"], 
+        "sensitivity_map": {"2010s": "high", "2020s": "high"}
+    },
 
     # --- C. コミュニケーション ---
     {
@@ -117,10 +153,10 @@ RISK_CONCEPTS = [
         "domain": DOMAIN_PRESSURE,
         "risk_factor": {"id": "Tone_Policing", "label": "価値観の押し付け"},
         "norm": {
-            "name": "消費者契約法（不当勧誘）の精神", 
-            "type": "law_spirit",
-            "issuer": "日本政府",
-            "jurisdiction": "Japan"
+            "name": "心理的リアクタンス", 
+            "type": "reactance",
+            "issuer": "生活者",
+            "jurisdiction": "People"
         },
         "affected_groups": ["生活者全般", "不安を抱える層"],
         "typical_associations": ["まだ〜してないの？", "覚悟が足りない", "プロなら〜すべき", "勝ち組・負け組"],
@@ -364,5 +400,155 @@ def setup_ontology(load_mode="full"):
 
     print(">>> Ontology Load Complete.")
 
+
+# ==========================================
+# 4. Ontology Visualization (matplotlib)
+# ==========================================
+
+def _fetch_ontology_edges(session, limit: int = 500):
+    """Fetch a lightweight edge list for visualization."""
+    query = """
+    MATCH (s)-[r]->(t)
+    WHERE (s:Concept OR s:ContextConcept OR s:TypicalAssociation OR s:RoleConcept OR s:RiskFactor)
+      AND (t:Concept OR t:RiskFactor OR t:Norm OR t:AffectedGroup)
+      AND type(r) IN ['LEADS_TO','TRIGGERS','VIOLATES','OFFENDS','MAPS_TO','IN_CONTEXT_OF']
+    RETURN labels(s)[0] AS s_label, coalesce(s.name, s.id) AS s_name,
+           type(r) AS rel,
+           labels(t)[0] AS t_label, coalesce(t.name, t.id) AS t_name
+    LIMIT $limit
+    """
+    rows = session.run(query, limit=limit)
+    return [dict(r) for r in rows]
+
+
+def visualize_ontology_matplotlib(limit: int = 500, figsize=(14, 10), with_legend: bool = True):
+    """Render the ontology graph with matplotlib.
+
+    Notes:
+    - This is intended for quick inspection, not publication-quality diagrams.
+    - Node colors are assigned by label.
+    """
+    if not NEO4J_PASSWORD:
+        print("Error: NEO4J_PASSWORD is missing; cannot visualize.")
+        return
+
+    with GraphDatabase.driver(NEO4J_URI, auth=AUTH) as driver:
+        driver.verify_connectivity()
+        with driver.session() as session:
+            edges = _fetch_ontology_edges(session, limit=limit)
+
+    if not edges:
+        print("No edges found to visualize.")
+        return
+
+    # Resolve an actual Japanese font file (Hiragino Sans) when available.
+    # This is more reliable than relying on rcParams alone for NetworkX label rendering.
+    prop = None
+    try:
+        font_path = fm.findfont(fm.FontProperties(family="Hiragino Sans"), fallback_to_default=True)
+        if font_path and os.path.exists(font_path):
+            prop = fm.FontProperties(fname=font_path)
+    except Exception:
+        prop = None
+
+    G = nx.DiGraph()
+
+    # Build graph
+    for e in edges:
+        s = f"{e['s_label']}:{e['s_name']}"
+        t = f"{e['t_label']}:{e['t_name']}"
+        G.add_node(s, label=e['s_label'])
+        G.add_node(t, label=e['t_label'])
+        G.add_edge(s, t, rel=e['rel'])
+
+    # Layout
+    pos = nx.spring_layout(G, seed=42, k=None)
+
+    # Color mapping (matplotlib default cycle; do not hardcode specific colors)
+    labels = sorted({data.get('label', 'Unknown') for _, data in G.nodes(data=True)})
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', [])
+    if not color_cycle:
+        color_cycle = ['C0','C1','C2','C3','C4','C5','C6','C7','C8','C9']
+    label_to_color = {lab: color_cycle[i % len(color_cycle)] for i, lab in enumerate(labels)}
+
+    node_colors = [label_to_color.get(G.nodes[n].get('label', 'Unknown'), 'C0') for n in G.nodes()]
+
+    plt.figure(figsize=figsize)
+    nx.draw_networkx_nodes(G, pos, node_size=500, alpha=0.9, node_color=node_colors)
+
+    # Edge labels (relationship types)
+    nx.draw_networkx_edges(G, pos, arrows=True, arrowstyle='-|>', arrowsize=12, width=1.2, alpha=0.7)
+
+    # Keep node labels compact
+    short_labels = {n: n.split(':', 1)[1] for n in G.nodes()}
+
+    # Draw labels with explicit FontProperties when available
+    # Draw node labels manually (works across NetworkX versions)
+    ax = plt.gca()
+    for node, label in short_labels.items():
+        x, y = pos[node]
+        if prop is not None:
+            ax.text(
+                x, y, label,
+                fontsize=8,
+                fontproperties=prop,
+                ha="center", va="center"
+            )
+        else:
+            ax.text(
+                x, y, label,
+                fontsize=8,
+                ha="center", va="center"
+            )
+
+    # Draw edge labels manually at midpoints
+    ax = plt.gca()
+    for u, v, d in G.edges(data=True):
+        rel = d.get("rel", "")
+        if not rel:
+            continue
+        x1, y1 = pos[u]
+        x2, y2 = pos[v]
+        xm, ym = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+        if prop is not None:
+            ax.text(
+                xm, ym, rel,
+                fontsize=7,
+                fontproperties=prop,
+                ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, linewidth=0)
+            )
+        else:
+            ax.text(
+                xm, ym, rel,
+                fontsize=7,
+                ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, linewidth=0)
+            )
+
+    if with_legend:
+        handles = []
+        for lab in labels:
+            handles.append(plt.Line2D([0], [0], marker='o', linestyle='', markersize=8, label=lab,
+                                      markerfacecolor=label_to_color[lab], markeredgecolor=label_to_color[lab]))
+        plt.legend(handles=handles, loc='best', fontsize=8)
+
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == "__main__":
-    setup_ontology()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Load ontology into Neo4j and optionally visualize it.")
+    parser.add_argument("--no-load", action="store_true", help="Skip loading and only visualize existing data.")
+    parser.add_argument("--plot", action="store_true", help="Visualize the ontology with matplotlib.")
+    parser.add_argument("--limit", type=int, default=500, help="Max number of edges to fetch for plotting.")
+    args = parser.parse_args()
+
+    if not args.no_load:
+        setup_ontology()
+
+    if args.plot:
+        visualize_ontology_matplotlib(limit=args.limit)
