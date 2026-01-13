@@ -60,11 +60,125 @@ def check_preconditions(driver: Any) -> bool:
                 logger.error("Please run 'ontology_loader.py' first to create indexes.")
                 return False
 
-            logger.info("Pre-flight check passed: 'concept_index' exists.")
+            # context_concept_index の存在確認（PlacementContext -> ContextConcept 用）
+            result2 = session.run("SHOW VECTOR INDEXES YIELD name WHERE name = 'context_concept_index'")
+            if not result2.single():
+                logger.error("CRITICAL: Vector index 'context_concept_index' not found in Neo4j.")
+                logger.error("Please create it (e.g., via ontology_loader.py or Neo4j Browser) before mapping PlacementContext.")
+                return False
+
+            logger.info("Pre-flight check passed: 'concept_index' and 'context_concept_index' exist.")
             return True
     except Exception as e:
         logger.error(f"Pre-flight check failed: {e}")
         return False
+
+def map_placement_contexts_to_context_concepts(
+    driver,
+    ad_id=None,
+    top_k: int = 8,
+    similarity_threshold: float = 0.70,
+    overwrite: bool = False,
+):
+    """
+    PlacementContext -> ContextConcept のベクトル検索マッピングを作成する。
+
+    - MAPS_TO: score >= similarity_threshold
+    - CANDIDATE_OF: score >= (similarity_threshold - 0.10) かつ MAPS_TO 未満
+
+    前提:
+    - Neo4j に vector index `context_concept_index` が存在する
+    - ContextConcept.embedding が格納済み（ontology_loader で投入）
+    """
+    with driver.session() as session:
+        # 対象PlacementContext取得（広告単位 or 全件）
+        if ad_id is not None:
+            pcs = session.run(
+                """
+                MATCH (ad:Ad {id:$ad_id})-[:PLACED_IN]->(pc:PlacementContext)
+                RETURN elementId(pc) AS pc_eid,
+                       pc.media_type AS media_type,
+                       pc.timing AS timing,
+                       pc.target AS target
+                """,
+                ad_id=str(ad_id),
+            )
+        else:
+            pcs = session.run(
+                """
+                MATCH (pc:PlacementContext)
+                RETURN elementId(pc) AS pc_eid,
+                       pc.media_type AS media_type,
+                       pc.timing AS timing,
+                       pc.target AS target
+                """
+            )
+
+        pcs = list(pcs)
+
+        # overwrite 対応（既存リンク削除）
+        if overwrite:
+            if ad_id is not None:
+                session.run(
+                    """
+                    MATCH (ad:Ad {id:$ad_id})-[:PLACED_IN]->(pc:PlacementContext)-[r:MAPS_TO|CANDIDATE_OF]->(:ContextConcept)
+                    DELETE r
+                    """,
+                    ad_id=str(ad_id),
+                )
+            else:
+                session.run(
+                    """
+                    MATCH (pc:PlacementContext)-[r:MAPS_TO|CANDIDATE_OF]->(:ContextConcept)
+                    DELETE r
+                    """
+                )
+
+        min_score = float(similarity_threshold) - 0.10
+
+        for rec in pcs:
+            pc_eid = rec["pc_eid"]
+            # PlacementContext をテキスト化（embedding用）
+            text = " ".join(
+                [
+                    rec.get("media_type") or "",
+                    rec.get("timing") or "",
+                    rec.get("target") or "",
+                ]
+            ).strip()
+            if not text:
+                continue
+
+            # 既存 mapper.py の埋め込み生成関数に合わせて呼び出し名を調整してください
+            # 例: emb = get_embedding_with_retry(text)
+            emb = get_embedding_with_retry(text)  # ←あなたの mapper.py に存在する関数名に合わせる
+            if emb is None:
+                continue
+
+            session.run(
+                """
+                MATCH (pc) WHERE elementId(pc) = $pc_eid
+
+                CALL db.index.vector.queryNodes('context_concept_index', $k, $emb)
+                YIELD node AS cc, score
+
+                WITH pc, cc, score
+                WHERE score >= $min_score
+
+                MERGE (pc)-[rel:CANDIDATE_OF {source:'inference'}]->(cc)
+                SET rel.similarity = score,
+                    rel.margin = score - $threshold
+
+                FOREACH (_ IN CASE WHEN score >= $threshold THEN [1] ELSE [] END |
+                    SET rel:MAPS_TO
+                )
+                """,
+                pc_eid=pc_eid,
+                k=int(top_k),
+                emb=emb,
+                min_score=float(min_score),
+                threshold=float(similarity_threshold),
+            )
 
 def map_associations_to_concepts(
     driver: Optional[Any] = None,
@@ -130,6 +244,19 @@ def map_associations_to_concepts(
                     associations = list(session.run(fetch_query, ad_id=str(ad_id)))
 
             logger.info(f"Found {len(associations)} candidate associations. (ad_id={ad_id})")
+
+            # --- PlacementContext -> ContextConcept のマッピング ---
+            # Association のマッピングとは独立に実行する（論文の文脈推論を有効化するため）
+            try:
+                map_placement_contexts_to_context_concepts(
+                    driver,
+                    ad_id=ad_id,
+                    top_k=int(top_k),
+                    similarity_threshold=float(similarity_threshold),
+                    overwrite=bool(overwrite),
+                )
+            except Exception as e:
+                logger.error(f"PlacementContext mapping failed (ad_id={ad_id}): {e}")
 
             mapped = 0
             skipped = 0

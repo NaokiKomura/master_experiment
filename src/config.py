@@ -16,6 +16,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o"
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "256"))
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "") or None
 
 # --- Neo4j設定 ---
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
