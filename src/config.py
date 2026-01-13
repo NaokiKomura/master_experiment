@@ -1,24 +1,35 @@
-# config.py
 import os
-from openai import OpenAI
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
 
-def get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
-    val = os.getenv(name, default)
-    if required and (val is None or val == ""):
-        raise RuntimeError(f"Environment variable '{name}' is required but not set.")
-    return val
+# --- パス設定 ---
+# このファイル(src/config.py)のあるディレクトリ
+SRC_DIR = Path(__file__).resolve().parent
+# プロジェクトルート (srcの親ディレクトリ)
+PROJECT_ROOT = SRC_DIR.parent
 
-# OpenAI
-OPENAI_API_KEY = get_env("OPENAI_API_KEY", required=True)
-OPENAI_MODEL = get_env("OPENAI_MODEL", default="gpt-4.1-mini")  # 必要に応じて変更
-OPENAI_EMBEDDING_MODEL = get_env("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small")
+# .envファイルの読み込み (プロジェクトルートにあると想定)
+load_dotenv(PROJECT_ROOT / ".env")
 
-def get_openai_client() -> OpenAI:
-    return OpenAI(api_key=OPENAI_API_KEY)
+# --- OpenAI設定 ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMBEDDING_MODEL = "text-embedding-3-small"
+CHAT_MODEL = "gpt-4o"
 
-# Neo4j
-NEO4J_URI = get_env("NEO4J_URI", default="bolt://localhost:7687")
-NEO4J_USER = get_env("NEO4J_USER", default="neo4j")
-NEO4J_PASSWORD = get_env("NEO4J_PASSWORD", required=True)
-
+# --- Neo4j設定 ---
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 NEO4J_AUTH = (NEO4J_USER, NEO4J_PASSWORD)
+
+# --- ファイルパス設定 ---
+# キャッシュファイルは src ディレクトリ内に保存
+CACHE_FILE = SRC_DIR / "embedding_cache.json"
+
+# 実験データCSV (プロジェクトルートにあると想定)
+DATA_FILE = PROJECT_ROOT / "research_data.csv" 
+
+# --- バリデーション ---
+if not OPENAI_API_KEY:
+    print("Warning: OPENAI_API_KEY is not set in .env")
