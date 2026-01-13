@@ -1,7 +1,20 @@
-#srcディレクトリにて streamlit run rag_app.py で実行可能
+"""rag_app.py
 
-import streamlit as st
+Streamlit デモアプリ + バッチ実験用の Graph RAG（リスクパス抽出）API。
+
+- Streamlit 実行: srcディレクトリで `streamlit run rag_app.py`
+- バッチ実行（例: batch_experiment.py）からは `extract_risk_paths()` を呼び出す
+
+方針:
+- import 時に Streamlit を必須にしない（バッチ環境で import エラーにならない）
+- Graph RAG の中核は Neo4j クエリでパスを返す
+"""
+
+from __future__ import annotations
+
 import time
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 from neo4j import GraphDatabase
 from openai import OpenAI
@@ -14,7 +27,11 @@ from processor import AdContentProcessor
 from loader import load_to_neo4j, clear_ad_data
 from mapper import map_associations_to_concepts
 
-st.set_page_config(page_title="Ad Risk Graph RAG Demo", layout="wide")
+# Streamlit はデモ実行時のみ必要（import-safe）
+try:
+    import streamlit as st  # type: ignore
+except Exception:  # pragma: no cover
+    st = None
 
 def generate_risk_explanation(input_text, risk_paths, era):
     """
@@ -73,9 +90,70 @@ def generate_risk_explanation(input_text, risk_paths, era):
     except Exception as e:
         return f"Error generating explanation: {e}"
 
+# --- Batch/CLI usable API ---
+
+def _compute_risk_score(paths: List[Dict[str, Any]]) -> float:
+    """リスクスコア（連続値）をパス集合から作る。
+
+    目的:
+    - PR-AUC 等のランキング指標が算出できるよう、0/1以外のスコアを提供する
+
+    現状のスコア定義（シンプル）:
+    - MAPS_TO/CANDIDATE_OF の similarity の最大値を採用
+    - similarity が無い場合は 0.0
+
+    ※論文側で別定義（例: margin を加味、パス数加点等）にしたい場合はここを差し替える。
+    """
+    sims: List[float] = []
+    for p in paths:
+        try:
+            v = p.get("similarity", None)
+            if v is None:
+                continue
+            sims.append(float(v))
+        except Exception:
+            continue
+    return max(sims) if sims else 0.0
+
+
+def extract_risk_paths(
+    driver: Any,
+    ad_id: str,
+    max_paths: int = 20,
+    era: str = "2020s",
+) -> Dict[str, Any]:
+    """Graph RAG 相当: 指定広告(ad_id)についてリスク推論パスを抽出する。
+
+    batch_experiment.py から利用することを想定した関数。
+
+    Returns:
+        {
+          "risk_score": float,           # 連続値（ランキング用）
+          "paths": List[dict],           # 根拠パス（最大 max_paths）
+          "era": str,
+          "ad_id": str,
+        }
+
+    備考:
+    - 2値判定は batch_experiment.py 側で `len(paths)>0 or risk_score>0` として行う。
+    """
+    paths = get_risk_analysis(driver, ad_id, era, limit=50)
+
+    # max_paths 制限（重要: DB側で LIMIT していないためここで絞る）
+    if max_paths is not None and max_paths > 0:
+        paths = paths[: int(max_paths)]
+
+    risk_score = _compute_risk_score(paths)
+    return {
+        "risk_score": float(risk_score),
+        "paths": list(paths),
+        "era": era,
+        "ad_id": ad_id,
+    }
+
 # --- 検索機能 (Retrieval) ---
 
-def get_risk_analysis(driver, ad_id, era):
+def get_risk_analysis(driver, ad_id: str, era: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
     指定された時代(era)に基づいてリスクパスを探索する
     """
@@ -105,13 +183,19 @@ def get_risk_analysis(driver, ad_id, era):
         risk.label as risk_label,
         norm.name as norm,
         collect(DISTINCT group.name) as affected_groups
-    ORDER BY risk_label
+    ORDER BY similarity DESC, risk_label
+    LIMIT $limit
     """
     with driver.session() as session:
-        result = session.run(query, ad_id=ad_id, era=era)
+        result = session.run(query, ad_id=ad_id, era=era, limit=int(limit))
         return [record.data() for record in result]
 
 def main():
+    if st is None:
+        raise RuntimeError("streamlit がインストールされていません。デモ起動には `pip install streamlit` が必要です。")
+
+    st.set_page_config(page_title="Ad Risk Graph RAG Demo", layout="wide")
+
     st.title("🛡️ Ad Risk Analysis System")
     
     show_debug = False
@@ -163,7 +247,7 @@ def main():
 
             # --- Step 4: Graph RAG (Retrieve & Generate) ---
             driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-            results = get_risk_analysis(driver, ad_id, selected_era)
+            results = get_risk_analysis(driver, ad_id, selected_era, limit=50)
             driver.close()
 
             with col2:

@@ -1,7 +1,10 @@
-import os
+from __future__ import annotations
+
 import sys
 import time
 import logging
+from typing import Any, Dict, List, Optional
+
 from openai import OpenAI, APIConnectionError, RateLimitError, APIError
 from neo4j import GraphDatabase
 
@@ -19,26 +22,34 @@ SIMILARITY_THRESHOLD = 0.75
 MARGIN_THRESHOLD = 0.02
 TOP_K_CANDIDATES = 5
 
-if not OPENAI_API_KEY:
-    logger.error("CRITICAL: OPENAI_API_KEY is not set.")
-    sys.exit(1)
+# import 時点では落とさない（batch環境でimportだけしたいケースがあるため）
+_OPENAI_CLIENT: Optional[OpenAI] = None
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-# (以下、関数定義は前回の回答と同じロジックですが、設定変数はconfigから取得したものを使います)
-def get_embedding_with_retry(text, max_retries=3):
-    if not text: return None
+def _get_openai_client() -> OpenAI:
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+        _OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
+    return _OPENAI_CLIENT
+
+def get_embedding_with_retry(text: str, max_retries: int = 3) -> Optional[List[float]]:
+    """OpenAI Embedding 取得（簡易リトライ付き）"""
+    if not text:
+        return None
+    client = _get_openai_client()
     for attempt in range(max_retries):
         try:
             response = client.embeddings.create(input=text, model=EMBEDDING_MODEL)
-            return response.data[0].embedding
+            return list(response.data[0].embedding)
         except (RateLimitError, APIConnectionError, APIError) as e:
             time.sleep(2 ** attempt)
         except Exception as e:
             return None
     return None
 
-def check_preconditions(driver):
+def check_preconditions(driver: Any) -> bool:
     """インデックス存在確認など、実行前の健全性チェック"""
     try:
         with driver.session() as session:
@@ -48,90 +59,175 @@ def check_preconditions(driver):
                 logger.error("CRITICAL: Vector index 'concept_index' not found in Neo4j.")
                 logger.error("Please run 'ontology_loader.py' first to create indexes.")
                 return False
+
             logger.info("Pre-flight check passed: 'concept_index' exists.")
             return True
     except Exception as e:
         logger.error(f"Pre-flight check failed: {e}")
         return False
 
-def map_associations_to_concepts():
-    if not NEO4J_AUTH[1]:
-        logger.error("CRITICAL: NEO4J_PASSWORD is not set.")
-        sys.exit(1)
+def map_associations_to_concepts(
+    driver: Optional[Any] = None,
+    *,
+    ad_id: Optional[str] = None,
+    top_k: int = TOP_K_CANDIDATES,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    margin_threshold: float = MARGIN_THRESHOLD,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Association -> Concept のマッピング（推論リンク）を作成する。
+
+    - Streamlit デモからは引数無しで呼び出せる（全Associationを対象）
+    - batch_experiment.py からは driver/ad_id を渡して広告単位で処理できる
+
+    Args:
+        driver: Neo4j driver（Noneの場合は config から生成して内部でcloseする）
+        ad_id: 指定時はその広告からEVOKESされるAssociationだけ対象
+        top_k: ベクトル検索候補数
+        similarity_threshold: best_score がこの値以上のときだけリンクを張る
+        margin_threshold: (best - second) がこの値以上なら MAPS_TO、未満なら CANDIDATE_OF
+        overwrite: 既存の推論リンク（source='inference'）を削除して再作成する
+
+    Returns:
+        dict: 実行サマリ
+    """
+    if driver is None:
+        if not NEO4J_AUTH[1]:
+            raise RuntimeError("NEO4J_PASSWORD is not set.")
+        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+        close_driver = True
+    else:
+        close_driver = False
 
     try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         driver.verify_connectivity()
-    except Exception as e:
-        logger.error(f"Neo4j Connection Failed: {e}")
-        return
+        if not check_preconditions(driver):
+            raise RuntimeError("Pre-flight check failed: concept_index not found.")
 
-    # 事前チェック
-    if not check_preconditions(driver):
-        driver.close()
-        sys.exit(1)
-
-    with driver.session() as session:
-        # 1. 未マッピング取得
-        fetch_query = """
-            MATCH (a:Association)
-            WHERE NOT (a)-[:MAPS_TO {source: 'inference'}]->(:Concept)
-              AND NOT (a)-[:CANDIDATE_OF {source: 'inference'}]->(:Concept)
-            RETURN elementId(a) AS id, COALESCE(a.name, a.text) AS text, a.embedding AS embedding
-        """
-        result = session.run(fetch_query)
-        associations = list(result)
-        logger.info(f"Found {len(associations)} unmapped associations.")
-        
-        for record in associations:
-            assoc_id = record["id"]
-            assoc_text = record["text"]
-            current_embedding = record["embedding"]
-            
-            if not assoc_text: continue
-
-            vector = current_embedding
-            if not vector:
-                vector = get_embedding_with_retry(assoc_text)
-                if vector:
-                    session.run("MATCH (a:Association) WHERE elementId(a) = $id SET a.embedding = $vector", 
-                                id=assoc_id, vector=vector)
+        with driver.session() as session:
+            if ad_id is None:
+                fetch_query = """
+                    MATCH (a:Association)
+                    WHERE NOT (a)-[:MAPS_TO {source: 'inference'}]->(:Concept)
+                      AND NOT (a)-[:CANDIDATE_OF {source: 'inference'}]->(:Concept)
+                    RETURN elementId(a) AS id, COALESCE(a.name, a.text) AS text, a.embedding AS embedding
+                """
+                associations = list(session.run(fetch_query))
+            else:
+                if overwrite:
+                    fetch_query = """
+                        MATCH (ad:Ad {id: $ad_id})-[:HAS_EXPRESSION]->(:Expression)-[:EVOKES]->(a:Association)
+                        RETURN DISTINCT elementId(a) AS id, COALESCE(a.name, a.text) AS text, a.embedding AS embedding
+                    """
+                    associations = list(session.run(fetch_query, ad_id=str(ad_id)))
                 else:
+                    fetch_query = """
+                        MATCH (ad:Ad {id: $ad_id})-[:HAS_EXPRESSION]->(:Expression)-[:EVOKES]->(a:Association)
+                        WHERE NOT (a)-[:MAPS_TO {source: 'inference'}]->(:Concept)
+                          AND NOT (a)-[:CANDIDATE_OF {source: 'inference'}]->(:Concept)
+                        RETURN DISTINCT elementId(a) AS id, COALESCE(a.name, a.text) AS text, a.embedding AS embedding
+                    """
+                    associations = list(session.run(fetch_query, ad_id=str(ad_id)))
+
+            logger.info(f"Found {len(associations)} candidate associations. (ad_id={ad_id})")
+
+            mapped = 0
+            skipped = 0
+            for record in associations:
+                assoc_id = record["id"]
+                assoc_text = record["text"]
+                current_embedding = record.get("embedding")
+
+                if not assoc_text:
+                    skipped += 1
                     continue
 
-            # ベクトル検索
-            search_query = """
-            CALL db.index.vector.queryNodes('concept_index', $k, $vector)
-            YIELD node AS concept, score
-            RETURN concept.name AS concept_name, score
-            ORDER BY score DESC
-            """
-            matches = list(session.run(search_query, k=TOP_K_CANDIDATES, vector=vector))
-            
-            if not matches: continue
+                if overwrite:
+                    session.run(
+                        """
+                        MATCH (a:Association) WHERE elementId(a) = $id
+                        OPTIONAL MATCH (a)-[r:MAPS_TO|CANDIDATE_OF {source: 'inference'}]->(:Concept)
+                        DELETE r
+                        """,
+                        id=assoc_id,
+                    )
 
-            best_match = matches[0]
-            best_score = best_match["score"]
-            best_concept = best_match["concept_name"]
-            margin = 0.0
-            if len(matches) > 1:
-                margin = best_score - matches[1]["score"]
+                vector = current_embedding
+                if not vector:
+                    vector = get_embedding_with_retry(str(assoc_text))
+                    if vector:
+                        session.run(
+                            "MATCH (a:Association) WHERE elementId(a) = $id SET a.embedding = $vector",
+                            id=assoc_id,
+                            vector=vector,
+                        )
+                    else:
+                        skipped += 1
+                        continue
 
-            if best_score < SIMILARITY_THRESHOLD: continue
+                matches = list(
+                    session.run(
+                        """
+                        CALL db.index.vector.queryNodes('concept_index', $k, $vector)
+                        YIELD node AS concept, score
+                        RETURN concept.name AS concept_name, score
+                        ORDER BY score DESC
+                        """,
+                        k=int(top_k),
+                        vector=vector,
+                    )
+                )
+                if not matches:
+                    skipped += 1
+                    continue
 
-            rel_type = "MAPS_TO" if margin >= MARGIN_THRESHOLD else "CANDIDATE_OF"
-            
-            query = f"""
-            MATCH (a:Association) WHERE elementId(a) = $assoc_id
-            MATCH (c:Concept {{name: $concept_name}})
-            MERGE (a)-[r:{rel_type} {{source: 'inference'}}]->(c)
-            SET r.similarity = $score, r.margin = $margin, r.threshold_used = $threshold, r.timestamp = datetime()
-            """
-            session.run(query, assoc_id=assoc_id, concept_name=best_concept, 
-                        score=best_score, margin=margin, threshold=SIMILARITY_THRESHOLD)
+                best_score = float(matches[0]["score"])
+                best_concept = matches[0]["concept_name"]
+                margin = 0.0
+                if len(matches) > 1:
+                    try:
+                        margin = best_score - float(matches[1]["score"])
+                    except Exception:
+                        margin = 0.0
 
-    driver.close()
-    logger.info("Mapping process completed.")
+                if best_score < float(similarity_threshold):
+                    skipped += 1
+                    continue
+
+                rel_type = "MAPS_TO" if margin >= float(margin_threshold) else "CANDIDATE_OF"
+                session.run(
+                    f"""
+                    MATCH (a:Association) WHERE elementId(a) = $assoc_id
+                    MATCH (c:Concept {{name: $concept_name}})
+                    MERGE (a)-[r:{rel_type} {{source: 'inference'}}]->(c)
+                    SET r.similarity = $score,
+                        r.margin = $margin,
+                        r.threshold_used = $threshold,
+                        r.timestamp = datetime()
+                    """,
+                    assoc_id=assoc_id,
+                    concept_name=best_concept,
+                    score=best_score,
+                    margin=float(margin),
+                    threshold=float(similarity_threshold),
+                )
+                mapped += 1
+
+        logger.info("Mapping process completed.")
+        return {
+            "ad_id": str(ad_id) if ad_id is not None else None,
+            "n_candidates": len(associations),
+            "mapped": int(mapped),
+            "skipped": int(skipped),
+            "top_k": int(top_k),
+            "similarity_threshold": float(similarity_threshold),
+            "margin_threshold": float(margin_threshold),
+            "overwrite": bool(overwrite),
+        }
+
+    finally:
+        if close_driver:
+            driver.close()
 
 if __name__ == "__main__":
     map_associations_to_concepts()
