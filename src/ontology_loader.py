@@ -226,7 +226,11 @@ def setup_ontology(load_mode="full"):
                 definition = item.get("definition")
                 domain = item.get("domain")
                 valid_eras = item.get("valid_eras", [])
-                sensitivity_map = item.get("sensitivity_map", {})
+                # Neo4j property cannot store MAP; keep original dict in Python and also store as JSON string + per-era primitives.
+                sensitivity_map_dict = item.get("sensitivity_map", {}) or {}
+                sensitivity_map_json = json.dumps(sensitivity_map_dict, ensure_ascii=False)
+                sensitivity_2010s = sensitivity_map_dict.get("2010s")
+                sensitivity_2020s = sensitivity_map_dict.get("2020s")
 
                 # Embeddings (optional)
                 concept_embedding = embedder.get_embedding(
@@ -253,7 +257,9 @@ def setup_ontology(load_mode="full"):
                         c.definition = $definition,
                         c.domain = $domain,
                         c.valid_eras = $valid_eras,
-                        c.sensitivity_map = $sensitivity_map,
+                        c.sensitivity_map_json = $sensitivity_map_json,
+                        c.sensitivity_2010s = $sensitivity_2010s,
+                        c.sensitivity_2020s = $sensitivity_2020s,
                         c.embedding = $concept_embedding
                     WITH c
                     MERGE (r:RiskFactor {id: $rf_id})
@@ -271,7 +277,9 @@ def setup_ontology(load_mode="full"):
                     definition=definition,
                     domain=domain,
                     valid_eras=valid_eras,
-                    sensitivity_map=sensitivity_map,
+                    sensitivity_map_json=sensitivity_map_json,
+                    sensitivity_2010s=sensitivity_2010s,
+                    sensitivity_2020s=sensitivity_2020s,
                     concept_embedding=concept_embedding,
                     rf_id=rf_id,
                     rf_label=rf_label,
@@ -327,7 +335,10 @@ def setup_ontology(load_mode="full"):
                 attributes = ctx.get("attributes", [])
                 domain = ctx.get("domain")
                 valid_eras = ctx.get("valid_eras", [])
-                sensitivity_map = ctx.get("sensitivity_map", {})
+                sensitivity_map_dict = ctx.get("sensitivity_map", {}) or {}
+                sensitivity_map_json = json.dumps(sensitivity_map_dict, ensure_ascii=False)
+                sensitivity_2010s = sensitivity_map_dict.get("2010s")
+                sensitivity_2020s = sensitivity_map_dict.get("2020s")
 
                 # RiskFactor
                 rf = ctx.get("risk_factor", {}) or {}
@@ -352,7 +363,9 @@ def setup_ontology(load_mode="full"):
                         cc.attributes = $attributes,
                         cc.domain = $domain,
                         cc.valid_eras = $valid_eras,
-                        cc.sensitivity_map = $sensitivity_map,
+                        cc.sensitivity_map_json = $sensitivity_map_json,
+                        cc.sensitivity_2010s = $sensitivity_2010s,
+                        cc.sensitivity_2020s = $sensitivity_2020s,
                         cc.embedding = $ctx_embedding
                     WITH cc
                     MERGE (r:RiskFactor {id: $rf_id})
@@ -370,7 +383,9 @@ def setup_ontology(load_mode="full"):
                     attributes=attributes,
                     domain=domain,
                     valid_eras=valid_eras,
-                    sensitivity_map=sensitivity_map,
+                    sensitivity_map_json=sensitivity_map_json,
+                    sensitivity_2010s=sensitivity_2010s,
+                    sensitivity_2020s=sensitivity_2020s,
                     ctx_embedding=ctx_embedding,
                     rf_id=rf_id,
                     rf_label=rf_label,
