@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import uuid
 import time
@@ -16,6 +18,20 @@ except ImportError:
 # ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# --- Batch用の簡易API（batch_experiment.py から呼び出す想定） ---
+_PROCESSOR_SINGLETON: Optional["AdContentProcessor"] = None
+
+
+def get_processor_singleton() -> "AdContentProcessor":
+    """AdContentProcessor のシングルトンを返す。
+
+    バッチ評価では多数の広告を連続処理するため、毎回初期化（モデル設定等）しない。
+    """
+    global _PROCESSOR_SINGLETON
+    if _PROCESSOR_SINGLETON is None:
+        _PROCESSOR_SINGLETON = AdContentProcessor()
+    return _PROCESSOR_SINGLETON
 
 # バージョン管理用定数
 PROMPT_VERSION = "v2.0_fact_extraction"
@@ -170,6 +186,44 @@ class AdContentProcessor:
                 time.sleep(1)
 
         raise RuntimeError(f"Failed to analyze content after {max_retries} retries.")
+
+
+def extract_facts(
+    input_text: str,
+    ad_id: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """バッチ実験用: 広告文からfact extractionを行い、loaderが扱えるpayload(dict)を返す。
+
+    rag_app.py はクラス `AdContentProcessor.analyze_ad_content()` を直接使うが、
+    batch_experiment.py では統一的な関数APIを想定しているため、ここで薄いラッパーを提供する。
+
+    Args:
+        input_text: 広告コピー本文
+        ad_id: 既知の広告ID（CSVのID等）。指定された場合はpayloadのad_idをこの値に固定する。
+        meta: 任意メタ情報（csv_id, brand 等）。processor内部の決定論的ID生成にも影響し得る。
+
+    Returns:
+        payload: {
+          "ad_id": str,
+          "input_text": str,
+          "meta": dict,
+          "context": dict,
+          "expressions": list[dict]
+        }
+    """
+    # loader/load_to_neo4j のログにcsv_idが出るよう、指定が無ければ ad_id をcsv_idとして埋める
+    if meta is None and ad_id is not None:
+        meta = {"csv_id": str(ad_id)}
+
+    proc = get_processor_singleton()
+    payload = proc.analyze_ad_content(input_text=input_text, meta=meta)
+
+    # batch側のIDを優先して整合を取りやすくする
+    if ad_id is not None:
+        payload["ad_id"] = str(ad_id)
+
+    return payload
 
 if __name__ == "__main__":
     # 簡易テスト
