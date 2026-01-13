@@ -20,6 +20,9 @@
 - mapper.py    : Association -> Concept のマッピング
 - rag_app.py   : Graph RAG相当のクエリでリスクパス抽出
 
+実行コマンドの例（ベースライン手法を実施する場合）
+python3 batch_experiment.py --method proposed --era 2020s
+
 ※これらのAPIが未整備でも、関数名を合わせて実装すれば本スクリプトはそのまま動作します。
 """
 
@@ -62,6 +65,11 @@ try:
 except Exception:  # pragma: no cover
     rag_app = None
 
+try:
+    import baselines  # type: ignore
+except Exception:  # pragma: no cover
+    baselines = None
+
 
 # --- Metrics ---
 try:
@@ -92,6 +100,7 @@ class ExperimentRow:
 @dataclass
 class PredictionResult:
     ad_id: str
+    method: str
     y_true: int
     y_pred: int
     risk_score: float
@@ -124,6 +133,13 @@ def _require_modules() -> None:
             + ", ".join(missing)
             + "\n"
             + "これらがsrc配下に存在し、Pythonのimportパスに含まれていることを確認してください。"
+        )
+
+
+def _require_baselines() -> None:
+    if baselines is None:
+        raise RuntimeError(
+            "baselines.py がimportできません。src/baselines.py が存在し、Pythonのimportパスに含まれていることを確認してください。"
         )
 
 
@@ -249,6 +265,7 @@ def run_one(
     driver: Any,
     row: ExperimentRow,
     *,
+    method: str,
     overwrite: bool,
     association_top_k: int,
     concept_similarity_threshold: float,
@@ -277,6 +294,30 @@ def run_one(
     """
 
     try:
+        # --- Baselines ---
+        if method in {"zero-shot", "few-shot", "text-rag"}:
+            _require_baselines()
+
+            if method == "zero-shot":
+                y_pred = int(baselines.predict_zero_shot(row.text))  # type: ignore
+            elif method == "few-shot":
+                y_pred = int(baselines.predict_few_shot(row.text))  # type: ignore
+            else:  # text-rag
+                y_pred = int(baselines.predict_text_rag(row.text, driver))  # type: ignore
+
+            # baselineは0/1をそのままスコアとして扱う
+            return PredictionResult(
+                ad_id=row.ad_id,
+                method=method,
+                y_true=row.tag_true,
+                y_pred=y_pred,
+                risk_score=float(y_pred),
+                paths=[],
+                facts={},
+                mapped={},
+                error=None,
+            )
+
         facts: Dict[str, Any] = processor.extract_facts(row.text, ad_id=row.ad_id, meta=row.meta)  # type: ignore
 
         loaded: Dict[str, Any] = loader.upsert_ad_instance(  # type: ignore
@@ -314,6 +355,7 @@ def run_one(
 
         return PredictionResult(
             ad_id=row.ad_id,
+            method=method,
             y_true=row.tag_true,
             y_pred=y_pred,
             risk_score=risk_score,
@@ -327,6 +369,7 @@ def run_one(
         logging.exception("Failed on ad_id=%s", row.ad_id)
         return PredictionResult(
             ad_id=row.ad_id,
+            method=method,
             y_true=row.tag_true,
             y_pred=0,
             risk_score=0.0,
@@ -380,6 +423,7 @@ def save_outputs(
         [
             {
                 "ad_id": r.ad_id,
+                "method": r.method,
                 "y_true": r.y_true,
                 "y_pred": r.y_pred,
                 "risk_score": r.risk_score,
@@ -398,6 +442,7 @@ def save_outputs(
                 json.dumps(
                     {
                         "ad_id": r.ad_id,
+                        "method": r.method,
                         "y_true": r.y_true,
                         "y_pred": r.y_pred,
                         "risk_score": r.risk_score,
@@ -432,6 +477,15 @@ def parse_args(default_data: Path) -> argparse.Namespace:
     # Experiment params
     p.add_argument("--era", type=str, default="2020s", choices=["2020s", "2010s"], help="Era for risk judgement")
 
+    # Method selection (for baselines / ablations)
+    p.add_argument(
+        "--method",
+        type=str,
+        default="proposed",
+        choices=["proposed", "zero-shot", "few-shot", "text-rag"],
+        help="Method to evaluate: proposed (default), zero-shot, few-shot, text-rag",
+    )
+
     # Control flags
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing ad instances / mappings in Neo4j")
 
@@ -455,7 +509,11 @@ def main() -> None:
     args = parse_args(default_data)
     _setup_logger(args.log_level)
 
-    _require_modules()
+    # Require only what is needed for the chosen method
+    if args.method == "proposed":
+        _require_modules()
+    else:
+        _require_baselines()
 
     data_path = Path(args.data)
     rows = load_dataset(data_path, limit=args.limit)
@@ -473,6 +531,7 @@ def main() -> None:
             res = run_one(
                 driver,
                 row,
+                method=str(args.method),
                 overwrite=bool(args.overwrite),
                 association_top_k=int(args.association_top_k),
                 concept_similarity_threshold=float(args.concept_similarity_threshold),
