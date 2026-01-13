@@ -20,27 +20,142 @@ def load_to_neo4j(payload):
     try:
         driver.verify_connectivity()
         with driver.session() as session:
+            # 1. Adノードの作成
+            # CSV等のメタデータも含めて保存
             meta = payload.get('meta', {})
-            logger.info(f"Loading Ad: {ad_id}")
+            logger.info(f"Loading Ad: {ad_id} (CSV_ID: {meta.get('csv_id', 'N/A')})")
             
             session.run("""
                 MERGE (ad:Ad {id: $ad_id})
-                SET ad.csv_id = $csv_id, ad.copy_text = $copy_text, ad.timestamp = datetime()
-            """, ad_id=ad_id, csv_id=meta.get('csv_id'), copy_text=payload.get('input_text', ''))
+                SET ad.csv_id = $csv_id,
+                    ad.brand = $brand,
+                    ad.copy_text = $copy_text,
+                    ad.timestamp = datetime()
+            """, 
+            ad_id=ad_id, 
+            csv_id=meta.get('csv_id'), 
+            brand=meta.get('brand'),
+            copy_text=payload.get('input_text', ''))
 
-            # (以下、Expressions, Associations, Roles などのロード処理は前回のコードと同様)
-            # ...
+            # 2. PlacementContext (掲出文脈) の作成
+            # 論文の「コンテキストミスマッチ」を判定するための入力ノード
+            context = payload.get('context', {})
+            if context:
+                session.run("""
+                    MATCH (ad:Ad {id: $ad_id})
+                    MERGE (ctx:PlacementContext {ad_id: $ad_id})
+                    SET ctx.media_type = $media,
+                        ctx.timing = $timing,
+                        ctx.target = $target
+                    MERGE (ad)-[:PLACED_IN]->(ctx)
+                """, 
+                ad_id=ad_id,
+                media=context.get('media_type', 'unknown'),
+                timing=context.get('timing', 'unknown'),
+                target=context.get('target', 'unknown'))
+
+            # 3. Expressions, Associations, Roles, Evidence の展開
+            # processor.py の出力構造に依存します
+            expressions = payload.get('expressions', [])
+            
+            for i, expr in enumerate(expressions):
+                expr_text = expr.get('text', '')
+                if not expr_text: continue
+
+                # Expressionノード（広告内の具体的な表現箇所）
+                # インデックスiを使って一意性を担保
+                session.run("""
+                    MATCH (ad:Ad {id: $ad_id})
+                    MERGE (e:Expression {ad_id: $ad_id, index: $idx})
+                    SET e.text = $text
+                    MERGE (ad)-[:HAS_EXPRESSION]->(e)
+                """, ad_id=ad_id, idx=i, text=expr_text)
+
+                # --- Association (連想) ---
+                # mapper.py で処理対象となる重要ノード
+                # 名前(name)でMERGEすることで、全広告共通の「連想語プール」を作る（Embedding計算コスト削減）
+                for assoc_text in expr.get('associations', []):
+                    session.run("""
+                        MATCH (e:Expression {ad_id: $ad_id, index: $idx})
+                        MERGE (a:Association {name: $name})
+                        MERGE (e)-[:EVOKES]->(a)
+                    """, ad_id=ad_id, idx=i, name=assoc_text)
+
+                # --- DepictedRole (描かれた役割) ---
+                # オントロジーのRoleConceptに紐づく入力ノード
+                for role_text in expr.get('roles', []):
+                    session.run("""
+                        MATCH (e:Expression {ad_id: $ad_id, index: $idx})
+                        MERGE (r:DepictedRole {name: $name})
+                        MERGE (e)-[:DEPICTS]->(r)
+                    """, ad_id=ad_id, idx=i, name=role_text)
+
+                # --- Evidence (根拠) ---
+                # LLMが抽出した「なぜそう判断したか」の引用テキスト
+                evidence_text = expr.get('evidence', '')
+                if evidence_text:
+                    session.run("""
+                        MATCH (e:Expression {ad_id: $ad_id, index: $idx})
+                        MERGE (ev:Evidence {ad_id: $ad_id, index: $idx})
+                        SET ev.text = $text
+                        MERGE (ev)-[:SUPPORTS]->(e)
+                    """, ad_id=ad_id, idx=i, text=evidence_text)
+
+            logger.info(f"Successfully loaded Ad {ad_id} and its graph structure.")
+
     except Exception as e:
         logger.error(f"Error loading to Neo4j: {e}")
     finally:
-        driver.close()
+        if 'driver' in locals():
+            driver.close()
 
-def clear_ad_data():
-    driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+def clear_ad_data(driver=None):
+    """
+    実験用：オントロジー（知識）を残したまま、入力された広告データ（インスタンス）のみを削除する
+    """
+    query = """
+    MATCH (n)
+    WHERE n:Ad OR n:Expression OR n:PlacementContext OR n:Evidence OR n:DepictedRole
+    DETACH DELETE n
+    """
+    # Note: Association は他でも使われる可能性があるため、孤立した場合のみ消すなどの配慮がいるが、
+    # 実験のリセットとしては Association も消して再生成させるのが安全
+    query_assoc = """
+    MATCH (a:Association)
+    WHERE NOT (a)--(:Concept)  // 概念にマッピングされていない（入力由来の）連想のみ削除
+    DETACH DELETE a
+    """
+    
+    close_driver = False
+    if driver is None:
+        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+        close_driver = True
+
     try:
         with driver.session() as session:
             logger.info("Clearing Ad instance data...")
-            session.run("MATCH (n) WHERE n:Ad OR n:Expression OR n:PlacementContext OR n:Evidence OR n:DepictedRole DETACH DELETE n")
-            session.run("MATCH (a:Association) WHERE NOT (a)--(:Concept) DETACH DELETE a")
+            session.run(query)
+            # マッピング済みでないAssociationも掃除する場合
+            # session.run(query_assoc) 
+            logger.info("Ad data cleared.")
     finally:
-        driver.close()
+        if close_driver:
+            driver.close()
+
+if __name__ == "__main__":
+    # テスト用ダミーデータ
+    dummy_payload = {
+        "ad_id": "test_uuid_12345",
+        "input_text": "家事はママの仕事、がんばって。",
+        "meta": {"csv_id": "999", "brand": "TestBrand"},
+        "context": {"media_type": "TVCM", "timing": "Morning"},
+        "expressions": [
+            {
+                "text": "家事はママの仕事",
+                "associations": ["性別役割分業", "ワンオペ育児", "母親の負担"],
+                "roles": ["母親", "主婦"],
+                "evidence": "「ママの仕事」と明言している点"
+            }
+        ]
+    }
+    load_to_neo4j(dummy_payload)

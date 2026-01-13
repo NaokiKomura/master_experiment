@@ -1,3 +1,5 @@
+#srcディレクトリにて streamlit run rag_app.py で実行可能
+
 import streamlit as st
 import time
 import pandas as pd
@@ -14,12 +16,106 @@ from mapper import map_associations_to_concepts
 
 st.set_page_config(page_title="Ad Risk Graph RAG Demo", layout="wide")
 
-# ... (generate_risk_explanation, get_risk_analysis 関数は前回のロジックを使用)
-# get_risk_analysis 内のクエリは OPTIONAL MATCH を使用した最新版を使ってください
+def generate_risk_explanation(input_text, risk_paths, era):
+    """
+    検索されたグラフパス(根拠)に基づいて、リスクの説明文を生成する
+    """
+    if not risk_paths:
+        return None
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # グラフのパス情報をコンテキスト化
+    context_str = ""
+    for i, path in enumerate(risk_paths):
+        context_str += f"""
+        [Path {i+1}]
+        - 表現: {path['expression']}
+        - 連想: {path['association']}
+        - 抵触概念: {path['concept']} (定義: {path['definition']})
+        - 炎上要因: {path['risk_label']}
+        - 違反規範: {path['norm']}
+        - 影響集団: {', '.join(path['affected_groups'])}
+        """
+
+    system_prompt = f"""
+    あなたは広告リスク管理の専門コンサルタントです。
+    ユーザーが入力した広告コピーに対し、知識グラフから検出された「リスクの根拠（推論パス）」が提供されます。
+    これに基づき、マーケティング担当者向けの「リスク評価レポート」を作成してください。
+
+    【制約事項】
+    1. 提供された[Path]情報のみを根拠にしてください（ハルシネーション禁止）。
+    2. 判定基準の時代は「{era}」です。その時代の価値観に沿って解説してください。
+    3. 結論を先に述べ、その後に具体的な理由を記述してください。
+    4. トーンは客観的かつ論理的に。
+    """
+
+    user_prompt = f"""
+    【対象広告コピー】
+    {input_text}
+
+    【検出されたリスクパス（根拠）】
+    {context_str}
+
+    上記に基づき、この広告がなぜ炎上リスクを持つのか、具体的に説明してください。
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error generating explanation: {e}"
+
+# --- 検索機能 (Retrieval) ---
+
+def get_risk_analysis(driver, ad_id, era):
+    """
+    指定された時代(era)に基づいてリスクパスを探索する
+    """
+    query = """
+    MATCH (ad:Ad {id: $ad_id})
+    // 1. 広告表現から連想へ
+    MATCH (ad)-[:HAS_EXPRESSION]->(expr:Expression)-[:EVOKES]->(assoc:Association)
+    
+    // 2. 連想から概念へ (推論リンク または 知識リンク)
+    MATCH (assoc)-[link:MAPS_TO|CANDIDATE_OF]->(concept:Concept)
+    
+    // 3. 概念からリスク・規範へ
+    MATCH (concept)-[:LEADS_TO]->(risk:RiskFactor)-[:VIOLATES]->(norm:Norm)
+    OPTIONAL MATCH (risk)-[:OFFENDS]->(group:AffectedGroup)
+
+    // 4. 時代のフィルタリング
+    WHERE $era IN concept.valid_eras
+    
+    RETURN 
+        expr.text as expression,
+        assoc.name as association,
+        type(link) as link_type,
+        link.similarity as similarity,
+        link.margin as margin,
+        concept.name as concept,
+        concept.definition as definition,
+        risk.label as risk_label,
+        norm.name as norm,
+        collect(DISTINCT group.name) as affected_groups
+    ORDER BY risk_label
+    """
+    with driver.session() as session:
+        result = session.run(query, ad_id=ad_id, era=era)
+        return [record.data() for record in result]
 
 def main():
     st.title("🛡️ Ad Risk Analysis System")
     
+    show_debug = False
+
     with st.sidebar:
         selected_era = st.selectbox("📅 判定基準の時代", ["2020s", "2010s"])
         if st.button("Clear Data"):
@@ -32,28 +128,85 @@ def main():
         analyze_btn = st.button("Analyze")
 
     if analyze_btn and input_text:
+        status_text = st.empty()
+        progress_bar = st.progress(0)
+
         try:
-            # 1. Process
+            # --- Step 1: Processor ---
             processor = AdContentProcessor()
-            payload = processor.analyze_ad_content(input_text, {"csv_id": "DEMO"})
+            status_text.text("Step 1/3: Extracting facts from text (LLM)...")
+            progress_bar.progress(30)
+            
+            meta = {"csv_id": "DEMO_APP", "brand": "DemoBrand"}
+            payload = processor.analyze_ad_content(input_text, meta)
             ad_id = payload['ad_id']
             
-            # 2. Load
+            if show_debug:
+                with col1:
+                    st.json(payload)
+
+            # --- Step 2: Loader ---
+            status_text.text("Step 2/3: Loading structure to Knowledge Graph...")
+            progress_bar.progress(60)
             load_to_neo4j(payload)
-            
-            # 3. Map
+
+            # --- Step 3: Mapper ---
+            status_text.text("Step 3/3: Inferring semantic connections (Vector Search)...")
+            progress_bar.progress(80)
             map_associations_to_concepts()
             
-            # 4. RAG
+            progress_bar.progress(100)
+            status_text.text("Analysis Complete.")
+            time.sleep(0.5)
+            status_text.empty()
+            progress_bar.empty()
+
+            # --- Step 4: Graph RAG (Retrieve & Generate) ---
             driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-            # ここで get_risk_analysis を呼び出す
-            # results = get_risk_analysis(driver, ad_id, selected_era)
+            results = get_risk_analysis(driver, ad_id, selected_era)
             driver.close()
-            
-            # 結果表示ロジック...
+
+            with col2:
+                st.subheader(f"2. Analysis Results ({selected_era})")
+                
+                if not results:
+                    st.success("✅ No significant risks detected in this era.")
+                    st.info("※ 時代設定を変えるとリスクが検知される可能性があります。")
+                else:
+                    # --- 追加機能: 生成されたリスク説明の表示 ---
+                    st.markdown("### 📝 AI Risk Assessment")
+                    with st.spinner("Generating explanation..."):
+                        explanation = generate_risk_explanation(input_text, results, selected_era)
+                        st.info(explanation)
+
+                    # --- 既存機能: 詳細パスの表示 ---
+                    st.markdown("### 🔍 Evidence Paths (Graph Trace)")
+                    df = pd.DataFrame(results)
+                    for risk_label in df['risk_label'].unique():
+                        st.write(f"**🔥 {risk_label}**")
+                        subset = df[df['risk_label'] == risk_label]
+                        for _, row in subset.iterrows():
+                            with st.expander(f"表現: 「{row['expression']}」 → 概念: {row['concept']}"):
+                                st.markdown(f"""
+                                - **連想**: {row['association']}
+                                - **抵触した概念**: {row['concept']}
+                                  - 定義: *{row['definition']}*
+                                - **違反規範**: {row['norm']}
+                                - **影響集団**: {', '.join(row['affected_groups'])}
+                                - **判定タイプ**: {row['link_type']} (Similarity: {row['similarity']:.3f})
+                                """)
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Error occurred: {e}")
+
+    st.markdown("---")
+    st.markdown("### 📊 System Logic")
+    st.caption("""
+    1. **Fact Extraction**: 広告文から事実を抽出
+    2. **Graph Mapping**: 社会的概念へ接続
+    3. **Path Finding**: 炎上パスを探索
+    4. **Explanation**: 根拠パスに基づき解説を生成
+    """)
 
 if __name__ == "__main__":
     main()

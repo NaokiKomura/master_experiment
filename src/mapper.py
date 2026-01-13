@@ -38,6 +38,22 @@ def get_embedding_with_retry(text, max_retries=3):
             return None
     return None
 
+def check_preconditions(driver):
+    """インデックス存在確認など、実行前の健全性チェック"""
+    try:
+        with driver.session() as session:
+            # concept_index の存在確認
+            result = session.run("SHOW VECTOR INDEXES YIELD name WHERE name = 'concept_index'")
+            if not result.single():
+                logger.error("CRITICAL: Vector index 'concept_index' not found in Neo4j.")
+                logger.error("Please run 'ontology_loader.py' first to create indexes.")
+                return False
+            logger.info("Pre-flight check passed: 'concept_index' exists.")
+            return True
+    except Exception as e:
+        logger.error(f"Pre-flight check failed: {e}")
+        return False
+
 def map_associations_to_concepts():
     if not NEO4J_AUTH[1]:
         logger.error("CRITICAL: NEO4J_PASSWORD is not set.")
@@ -50,7 +66,10 @@ def map_associations_to_concepts():
         logger.error(f"Neo4j Connection Failed: {e}")
         return
 
-    # (中略: check_preconditionsなどは前回のコードを使用)
+    # 事前チェック
+    if not check_preconditions(driver):
+        driver.close()
+        sys.exit(1)
 
     with driver.session() as session:
         # 1. 未マッピング取得
