@@ -28,7 +28,7 @@ NEO4J_AUTH = (NEO4J_USER, NEO4J_PASSWORD)
 CACHE_FILE = SRC_DIR / "embedding_cache.json"
 
 # 実験データCSV (プロジェクトルートにあると想定)
-DATA_FILE = PROJECT_ROOT / "research_data.csv" 
+DATA_FILE = PROJECT_ROOT / "data/research_data.csv" 
 
 # --- バリデーション ---
 if not OPENAI_API_KEY:
